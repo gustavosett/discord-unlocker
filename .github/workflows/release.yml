@@ -1,0 +1,75 @@
+name: build-windows
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      GOOS: windows
+      GOARCH: amd64
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
+      - name: Definir versão
+        id: version
+        shell: pwsh
+        run: |
+          $version = if ('${{ github.ref }}' -match '^refs/tags/v(.+)$') { $Matches[1] } else { "0.1.4-ci.${{ github.run_number }}" }
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Instalar Inno Setup 6.7.3 verificado
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          $target = Join-Path $env:RUNNER_TEMP 'inno-6.7.3'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' `
+            -OutFile $installer
+          $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+          $expectedHash = '9C73C3BAE7ED48D44112A0F48E66742C00090BDB5BEF71D9D3C056C66E97B732'
+          if ($actualHash -ne $expectedHash) { throw "Unexpected Inno Setup SHA-256: $actualHash" }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'CN=Pyrsys B\.V\.') {
+            throw 'Inno Setup Authenticode verification failed.'
+          }
+          $process = Start-Process -FilePath $installer `
+            -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/PORTABLE=1', "/DIR=$target") `
+            -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Inno Setup install failed: $($process.ExitCode)" }
+          "ISCC_PATH=$(Join-Path $target 'ISCC.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Instalar gerador de recursos Windows
+        shell: pwsh
+        run: go install github.com/tc-hib/go-winres@v0.3.3
+
+      - name: Compilar validação sem assinatura
+        shell: pwsh
+        run: |
+          .\scripts\build-windows.ps1 `
+            -Version '${{ steps.version.outputs.value }}' `
+            -GoExe (Get-Command go).Source `
+            -WinResExe (Get-Command go-winres).Source `
+            -IsccExe $env:ISCC_PATH
+
+      - name: Publicar artefatos privados
+        uses: actions/upload-artifact@v4
+        with:
+          name: discord-unlocker-windows-x64-${{ steps.version.outputs.value }}-unsigned-validation
+          path: dist/
+          if-no-files-found: error

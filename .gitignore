@@ -1,0 +1,9 @@
+.tools/
+.cache/
+.diagnostics/
+.validation/
+dist/
+*.exe
+*.log
+coverage.out
+cmd/discord-unlocker/rsrc_windows_*.syso
