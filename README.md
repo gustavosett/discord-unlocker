@@ -2,6 +2,8 @@
 
 Launcher para Windows que prepara uma rota SOCKS5 temporária e abre o Discord Stable com um PAC embutido na própria linha de inicialização. Ele não instala VPN, adaptador de rede, driver, serviço, servidor local ou processo residente. Depois de iniciar o Discord, o launcher termina.
 
+Este é um projeto independente, sem vínculo, patrocínio ou aprovação da Discord Inc.
+
 O PAC tenta encaminhar somente `gateway.discord.gg`, seus hosts regionais de reconexão (`gateway-*.discord.gg`) e `remote-auth-gateway.discord.gg` por até três proxies SOCKS5 e usa `DIRECT` como último fallback. API, CDN, mídia, voz, vídeo, jogos, navegador e UDP não são desviados pelo aplicativo. Essa escolha reduz o escopo da rota intermediária, mas não é uma garantia de que recursos de vídeo serão liberados: o comportamento do Discord pode mudar e precisa ser validado manualmente em cada release.
 
 ## Uso
@@ -47,9 +49,17 @@ go install github.com/tc-hib/go-winres@v0.3.3
 
 O arquivo produzido mantém o nome `discord-unlocker-setup.exe`. Uma compilação
 local continua sem assinatura e serve apenas para validação; o nome do arquivo
-não é uma garantia de release. Não peça para alguém desativar o antivírus. Consulte
-[`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md) para a ordem de assinatura,
-verificação e revisão de falsos positivos exigida para uma release.
+não é uma garantia de segurança. Builds sem assinatura Authenticode podem
+acionar SmartScreen ou análises heurísticas. Confira o SHA-256 publicado e não
+desative o antivírus para executar o programa. Suspeitas de falso positivo devem
+ser enviadas ao fabricante que produziu o alerta.
+
+## Licença
+
+O código é distribuído sob a [licença MIT](LICENSE). O nome e as marcas do
+Discord pertencem aos seus respectivos titulares. O instalador copia o ícone da
+instalação oficial já existente no computador; o ícone não é redistribuído por
+este repositório.
 
 ## Referências
 
