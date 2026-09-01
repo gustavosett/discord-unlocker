@@ -59,7 +59,8 @@ ser enviadas ao fabricante que produziu o alerta.
 O código é distribuído sob a [licença MIT](LICENSE). O nome e as marcas do
 Discord pertencem aos seus respectivos titulares. O instalador copia o ícone da
 instalação oficial já existente no computador; o ícone não é redistribuído por
-este repositório.
+este repositório. Os avisos das ferramentas e bibliotecas usadas na compilação
+estão em [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
 
 ## Referências
 
