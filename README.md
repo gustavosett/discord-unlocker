@@ -48,11 +48,10 @@ go install github.com/tc-hib/go-winres@v0.3.3
 ```
 
 O arquivo produzido mantém o nome `discord-unlocker-setup.exe`. Uma compilação
-local continua sem assinatura e serve apenas para validação; o nome do arquivo
-não é uma garantia de segurança. Builds sem assinatura Authenticode podem
-acionar SmartScreen ou análises heurísticas. Confira o SHA-256 publicado e não
-desative o antivírus para executar o programa. Suspeitas de falso positivo devem
-ser enviadas ao fabricante que produziu o alerta.
+local continua sem assinatura digital. As versões oficiais ficam na página de
+Releases; `SHA256SUMS.txt` é disponibilizado para verificação opcional dos
+downloads. Sem uma assinatura paga, o Windows pode identificar o instalador
+como **Editor desconhecido**.
 
 ## Licença
 
