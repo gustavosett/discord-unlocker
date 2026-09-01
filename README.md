@@ -1,10 +1,12 @@
 # Discord Unlocker
 
-Launcher para Windows que prepara uma rota SOCKS5 temporária e abre o Discord Stable com um PAC embutido na própria linha de inicialização. Ele não instala VPN, adaptador de rede, driver, serviço, servidor local ou processo residente. Depois de iniciar o Discord, o launcher termina.
+Launcher para Windows que valida uma proxy SOCKS5 e abre o Discord Stable com uma rota dedicada somente ao processo do Discord. Ele não instala VPN, adaptador de rede, driver, serviço, servidor local ou processo residente. Depois de iniciar o Discord, o launcher termina.
 
 Este é um projeto independente, sem vínculo, patrocínio ou aprovação da Discord Inc.
 
-O PAC tenta encaminhar somente `gateway.discord.gg`, seus hosts regionais de reconexão (`gateway-*.discord.gg`) e `remote-auth-gateway.discord.gg` por até três proxies SOCKS5 e usa `DIRECT` como último fallback. API, CDN, mídia, voz, vídeo, jogos, navegador e UDP não são desviados pelo aplicativo. Essa escolha reduz o escopo da rota intermediária, mas não é uma garantia de que recursos de vídeo serão liberados: o comportamento do Discord pode mudar e precisa ser validado manualmente em cada release.
+O Chromium interno do Discord mantém as conexões TCP de controle, como API e Gateway, pela mesma proxy durante a sessão. Os hosts conhecidos de CDN, anexos, arquivos estáticos, storage e mídia são ignorados pela rota, e o SOCKS5 do Chromium não transporta UDP/WebRTC. O proxy do Windows, os demais programas e a conexão de jogos não são alterados. Assim, voz, vídeo e compartilhamento de tela continuam no caminho direto.
+
+O launcher usa uma única saída validada e não troca silenciosamente para o IP brasileiro. Com cache válido, só essa saída é revalidada nas próximas aberturas. Se ela cair, encerre completamente o Discord e abra o atalho novamente para selecionar outra saída.
 
 ## Uso
 
@@ -14,27 +16,27 @@ O PAC tenta encaminhar somente `gateway.discord.gg`, seus hosts regionais de rec
 
 Antes de alterar qualquer atalho, o instalador salva uma cópia binária do `.lnk` original. O desinstalador restaura esses atalhos e a inicialização automática somente quando ainda apontam para o launcher; mudanças posteriores feitas pelo usuário ou pelo Discord são preservadas.
 
-Se não encontrar uma saída válida, o programa preserva um Discord já aberto. Se ele estiver fechado, abre o Discord diretamente para manter texto e voz disponíveis. O modo com PAC não é aplicado nessa situação.
+Se o Discord já estiver aberto, executar o atalho novamente não encerra nem reinicia a sessão. Para aplicar a rota a uma instância aberta diretamente, use **Sair do Discord** no ícone ao lado do relógio e abra o atalho outra vez.
 
-Se o Windows negar o encerramento de um Discord iniciado com permissões diferentes, feche-o uma vez com `Alt+F4` enquanto a janela estiver em foco (ou **Sair do Discord** no ícone ao lado do relógio) e execute o atalho novamente. O launcher não pede elevação nem tenta contornar a proteção do processo.
+Se não encontrar uma saída válida e o Discord estiver fechado, o programa o abre diretamente para manter texto e voz disponíveis. O modo liberado não é aplicado nessa situação.
 
 ## Segurança e privacidade
 
-As listas públicas de proxies são tratadas como dados não confiáveis: o launcher limita a resposta, aceita somente IPs públicos e portas válidas, testa SOCKS5, exige TLS válido, verifica uma saída fora do Brasil e testa o Gateway do Discord antes de gerar o PAC. Apenas IPs e portas já validados entram no PAC. O conteúdo é codificado em base64 numa URL `data:` aceita pelo Chromium; nenhum texto recebido da API vira JavaScript.
+As listas públicas de proxies são tratadas como dados não confiáveis: o launcher limita a resposta, aceita somente IPs públicos e portas válidas, testa SOCKS5, exige TLS válido, verifica uma saída fora do Brasil e testa tanto o Gateway quanto a API pública do Discord. Apenas um IP e uma porta já validados entram nos argumentos do Chromium; nenhum texto arbitrário recebido da lista vira argumento ou código.
 
 O cache versionado guarda somente endpoint, país, latência e horário da validação por até 24 horas. O launcher não lê tokens, mensagens ou arquivos de perfil do Discord.
 
-Mesmo com TLS, uma proxy pública conhece o IP de origem, o destino, os horários e o volume aproximado das conexões que ela encaminha. Ela não é uma ferramenta de anonimato e não deve ser usada para dados sensíveis. O fallback `DIRECT` mantém o Discord utilizável caso as proxies caiam, mas pode fazer o recurso regional voltar a ser bloqueado até que o atalho seja executado de novo.
+Mesmo com TLS, uma proxy pública conhece o IP de origem, os destinos, os horários e o volume aproximado das conexões de controle que ela encaminha. O conteúdo continua protegido por TLS, mas a proxy não é uma ferramenta de anonimato e não deve ser tratada como tal. A mídia direta preserva a latência e a qualidade da chamada.
 
 ## Limites
 
 - Compatível inicialmente com Discord Stable do instalador oficial em Windows 10/11 x64, em `%LOCALAPPDATA%\Discord`.
 - Não modifica arquivos do Discord, não injeta código, não usa `Ctrl+R` e não usa `--no-sandbox`.
-- Não dá suporte a verificação de idade, conta, assinatura, bloqueios de servidor ou qualquer limitação que não dependa da rota de Gateway.
+- Não dá suporte a verificação de idade, conta, assinatura, bloqueios de servidor ou limitações sem relação com a região da conexão.
 - Não cria Cloudflare Worker: Workers não oferece um servidor TCP/CONNECT de entrada adequado para atuar como VPN.
 - Não existe plugin do Discord neste projeto; o cliente não oferece API oficial para isso e modificar o cliente aumenta risco de quebra e de conta.
 
-Antes de distribuir uma versão, teste manualmente a abertura de canais, câmera e Go Live, confirme que gateway usa SOCKS5 e mídia/CDN/UDP seguem diretos, derrube as proxies para observar o fallback e verifique que não restaram processos, serviços, drivers ou adaptadores do launcher.
+Antes de distribuir uma versão, teste manualmente a abertura de canais, câmera e Go Live, confirme que API/Gateway usam SOCKS5 e mídia/CDN/UDP seguem diretos, simule uma proxy indisponível e verifique que não restaram processos, serviços, drivers ou adaptadores do launcher.
 
 ## Desenvolvimento
 
@@ -44,7 +46,7 @@ sem compressão:
 
 ```powershell
 go install github.com/tc-hib/go-winres@v0.3.3
-.\scripts\build-windows.ps1 -Version 0.1.4
+.\scripts\build-windows.ps1 -Version 0.1.5
 ```
 
 O arquivo produzido mantém o nome `discord-unlocker-setup.exe`. Uma compilação
@@ -64,9 +66,9 @@ estão em [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
 ## Referências
 
 - [API pública ProxyScrape](https://docs.proxyscrape.com/api-reference/public-api/get-proxy-list)
-- [PAC, SOCKS5 e fallback no Chromium](https://chromium.googlesource.com/chromium/src/+/main/net/docs/proxy.md)
-- [Carregamento de PAC `data:` no Chromium](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/net/proxy_resolution/pac_file_fetcher_impl.cc)
+- [Configuração de proxy, SOCKS5 e bypass no Chromium](https://chromium.googlesource.com/chromium/src/+/main/net/docs/proxy.md)
 - [Switches de proxy do Electron](https://www.electronjs.org/docs/latest/api/command-line-switches)
+- [DiscordGoLiveBypass, referência de comportamento](https://github.com/thomassolcia/DiscordGoLiveBypass)
 - [Cloudflare trace](https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/)
 - [Aviso do Discord sobre vídeo no Brasil](https://support.discord.com/hc/pt-br/articles/42704051358359-Por-que-os-recursos-de-v%C3%ADdeo-est%C3%A3o-indispon%C3%ADveis-no-Brasil-no-momento)
 - [Medida preventiva da ANPD](https://www.gov.br/anpd/pt-br/assuntos/noticias/em-medida-preventiva-anpd-determina-que-discord-suspenda-transmissoes-ao-vivo-no-brasil)

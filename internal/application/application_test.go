@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -17,9 +16,13 @@ type fakeResolver struct {
 	endpoints []proxy.Endpoint
 	fetched   bool
 	err       error
+	calls     *int
 }
 
 func (fake fakeResolver) Resolve(_ context.Context, _ []proxy.Endpoint, progress proxy.ProgressFunc) ([]proxy.Endpoint, bool, error) {
+	if fake.calls != nil {
+		(*fake.calls)++
+	}
 	if progress != nil {
 		progress(proxy.Progress{Stage: proxy.ProgressFresh, Checked: 1, Total: 1, Verified: len(fake.endpoints)})
 	}
@@ -27,30 +30,35 @@ func (fake fakeResolver) Resolve(_ context.Context, _ []proxy.Endpoint, progress
 }
 
 type fakeDiscord struct {
-	running       []discord.ProcessInfo
-	runningErr    error
-	terminateErr  error
-	proxiedErr    error
-	directErr     error
-	terminateCall int
-	proxiedCall   int
-	directCall    int
+	running         []discord.ProcessInfo
+	runningSequence [][]discord.ProcessInfo
+	runningErr      error
+	proxiedErr      error
+	directErr       error
+	runningCall     int
+	proxiedCall     int
+	directCall      int
+	proxiedEndpoint proxy.Endpoint
 }
 
 func (fake *fakeDiscord) RunningProcesses() ([]discord.ProcessInfo, error) {
-	return append([]discord.ProcessInfo(nil), fake.running...), fake.runningErr
-}
-
-func (fake *fakeDiscord) TerminateAll(context.Context, time.Duration) error {
-	fake.terminateCall++
-	if fake.terminateErr == nil {
-		fake.running = nil
+	fake.runningCall++
+	if fake.runningErr != nil {
+		return nil, fake.runningErr
 	}
-	return fake.terminateErr
+	if len(fake.runningSequence) != 0 {
+		index := fake.runningCall - 1
+		if index >= len(fake.runningSequence) {
+			index = len(fake.runningSequence) - 1
+		}
+		return append([]discord.ProcessInfo(nil), fake.runningSequence[index]...), nil
+	}
+	return append([]discord.ProcessInfo(nil), fake.running...), nil
 }
 
-func (fake *fakeDiscord) LaunchWithPAC(context.Context, string, time.Duration) (discord.LaunchResult, error) {
+func (fake *fakeDiscord) LaunchWithProxy(_ context.Context, endpoint proxy.Endpoint, _ time.Duration) (discord.LaunchResult, error) {
 	fake.proxiedCall++
+	fake.proxiedEndpoint = endpoint
 	return discord.LaunchResult{PID: 100}, fake.proxiedErr
 }
 
@@ -79,41 +87,60 @@ func testRunner(t *testing.T, resolver Resolver, controller DiscordController, n
 	}
 }
 
-func TestRunWritesScopedPACThenRestartsDiscord(t *testing.T) {
+func TestRunCachesPoolAndLaunchesFastestDedicatedProxy(t *testing.T) {
 	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
-	controller := &fakeDiscord{running: []discord.ProcessInfo{{PID: 10}}}
-	runner := testRunner(t, fakeResolver{endpoints: []proxy.Endpoint{validEndpoint(now)}}, controller, now)
+	fastest := validEndpoint(now)
+	slower := proxy.Endpoint{Host: "1.1.1.1", Port: 1081, Country: "DE", Latency: time.Second, VerifiedAt: now}
+	controller := &fakeDiscord{}
+	runner := testRunner(t, fakeResolver{endpoints: []proxy.Endpoint{fastest, slower}}, controller, now)
 
 	result, err := runner.Run(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Mode != ModeProxied || !result.Restarted || controller.terminateCall != 1 || controller.proxiedCall != 1 || controller.directCall != 0 {
+	if result.Mode != ModeProxied || result.ProxyCount != 1 || controller.proxiedCall != 1 || controller.directCall != 0 {
 		t.Fatalf("resultado/chamadas inesperados: %#v, controller=%#v", result, controller)
 	}
-	contents, err := os.ReadFile(runner.Paths.PACFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(contents), "gateway.discord.gg") || !strings.Contains(string(contents), "SOCKS5 8.8.8.8:1080; DIRECT") {
-		t.Fatalf("PAC inesperado:\n%s", contents)
+	if controller.proxiedEndpoint.Address() != fastest.Address() {
+		t.Fatalf("proxy usada = %s, esperava %s", controller.proxiedEndpoint.Address(), fastest.Address())
 	}
 	if _, err := os.Stat(runner.Paths.CacheFile); err != nil {
 		t.Fatalf("cache não foi criado: %v", err)
 	}
 }
 
-func TestNoProxyPreservesRunningDiscord(t *testing.T) {
+func TestExistingDiscordIsNeverRestartedOrRevalidated(t *testing.T) {
 	now := time.Now()
+	resolverCalls := 0
 	controller := &fakeDiscord{running: []discord.ProcessInfo{{PID: 10}}}
-	runner := testRunner(t, fakeResolver{err: proxy.ErrNoVerifiedProxies}, controller, now)
+	runner := testRunner(t, fakeResolver{
+		endpoints: []proxy.Endpoint{validEndpoint(now)},
+		calls:     &resolverCalls,
+	}, controller, now)
 
 	result, err := runner.Run(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Mode != ModeExistingUntouched || controller.terminateCall != 0 || controller.directCall != 0 || controller.proxiedCall != 0 {
-		t.Fatalf("Discord aberto foi alterado: %#v, controller=%#v", result, controller)
+	if result.Mode != ModeAlreadyRunning || resolverCalls != 0 || controller.proxiedCall != 0 || controller.directCall != 0 {
+		t.Fatalf("Discord aberto foi alterado: %#v, resolver=%d controller=%#v", result, resolverCalls, controller)
+	}
+}
+
+func TestDiscordOpenedDuringDiscoveryIsPreserved(t *testing.T) {
+	now := time.Now()
+	controller := &fakeDiscord{runningSequence: [][]discord.ProcessInfo{
+		nil,
+		{{PID: 10}},
+	}}
+	runner := testRunner(t, fakeResolver{endpoints: []proxy.Endpoint{validEndpoint(now)}}, controller, now)
+
+	result, err := runner.Run(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Mode != ModeAlreadyRunning || controller.proxiedCall != 0 || controller.directCall != 0 {
+		t.Fatalf("corrida de inicialização não foi preservada: %#v, controller=%#v", result, controller)
 	}
 }
 
@@ -126,30 +153,12 @@ func TestNoProxyOpensDirectWhenDiscordClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Mode != ModeDirect || controller.directCall != 1 || controller.terminateCall != 0 {
+	if result.Mode != ModeDirect || controller.directCall != 1 || controller.proxiedCall != 0 {
 		t.Fatalf("fallback direto incorreto: %#v, controller=%#v", result, controller)
 	}
 }
 
-func TestFailedShutdownNeverStartsAnotherDiscord(t *testing.T) {
-	now := time.Now()
-	controller := &fakeDiscord{
-		running:      []discord.ProcessInfo{{PID: 10}},
-		terminateErr: errors.New("access denied"),
-	}
-	runner := testRunner(t, fakeResolver{endpoints: []proxy.Endpoint{validEndpoint(now)}}, controller, now)
-
-	result, err := runner.Run(context.Background(), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Mode != ModeExistingUntouched || controller.terminateCall != 1 ||
-		controller.proxiedCall != 0 || controller.directCall != 0 {
-		t.Fatalf("falha de encerramento não preservou o Discord: %#v, controller=%#v", result, controller)
-	}
-}
-
-func TestFailedPACBootstrapFallsBackDirect(t *testing.T) {
+func TestFailedProxyBootstrapFallsBackDirect(t *testing.T) {
 	now := time.Now()
 	controller := &fakeDiscord{proxiedErr: discord.ErrBootstrapFailed}
 	runner := testRunner(t, fakeResolver{endpoints: []proxy.Endpoint{validEndpoint(now)}}, controller, now)
@@ -180,6 +189,18 @@ func TestDirectLaunchFailureIsFatal(t *testing.T) {
 	controller := &fakeDiscord{directErr: errors.New("boom")}
 	runner := testRunner(t, fakeResolver{err: proxy.ErrNoVerifiedProxies}, controller, now)
 	if _, err := runner.Run(context.Background(), false); err == nil {
-		t.Fatal("esperava erro quando PAC e abertura direta falham")
+		t.Fatal("esperava erro quando proxy e abertura direta falham")
+	}
+}
+
+func TestProcessDiscoveryFailureNeverLaunchesProxy(t *testing.T) {
+	now := time.Now()
+	controller := &fakeDiscord{runningErr: errors.New("access denied")}
+	runner := testRunner(t, fakeResolver{endpoints: []proxy.Endpoint{validEndpoint(now)}}, controller, now)
+	if _, err := runner.Run(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	if controller.proxiedCall != 0 || controller.directCall != 1 {
+		t.Fatalf("detecção incerta lançou proxy: %#v", controller)
 	}
 }

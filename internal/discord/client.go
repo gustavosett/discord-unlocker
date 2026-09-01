@@ -10,16 +10,13 @@ import (
 
 const (
 	// DefaultBootstrapWindow is how long a directly launched Discord process
-	// must remain alive before LaunchWithPAC reports success.
+	// must remain alive before LaunchWithProxy reports success.
 	DefaultBootstrapWindow = 3 * time.Second
-	// DefaultShutdownTimeout bounds forced shutdown and process-release waits.
-	DefaultShutdownTimeout = 10 * time.Second
 )
 
 var (
-	// ErrDiscordRunning is returned when a PAC launch is attempted while a
-	// Discord Stable process is already running. The orchestrator must decide
-	// whether and when to call TerminateAll; the client never kills implicitly.
+	// ErrDiscordRunning is returned when a proxy launch is attempted while a
+	// Discord Stable process is already running. The client never terminates it.
 	ErrDiscordRunning = errors.New("Discord Stable is already running")
 	// ErrBootstrapFailed means that the directly launched Discord process exited
 	// before the requested bootstrap survival window elapsed.

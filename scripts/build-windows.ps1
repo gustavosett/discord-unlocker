@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [string] $Version = '0.1.4-dev',
+    [string] $Version = '0.1.5-dev',
 
     [Parameter()]
     [string] $GoExe = 'go',
@@ -32,7 +32,7 @@ function ConvertTo-NumericVersion {
     param([Parameter(Mandatory)][string] $Value)
 
     if ($Value -notmatch '^v?(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)(?:[-.]ci[.-]?(?<build>\d+))?(?:[-+].*)?$') {
-        throw "Version '$Value' must begin with major.minor.patch (for example 0.1.4 or 0.1.4-ci.27)."
+        throw "Version '$Value' must begin with major.minor.patch (for example 0.1.5 or 0.1.5-ci.27)."
     }
 
     $parts = @(

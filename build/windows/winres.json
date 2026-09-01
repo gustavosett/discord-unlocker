@@ -2,7 +2,7 @@
   "RT_MANIFEST": {
     "#1": {
       "0409": {
-        "description": "Starts Discord Stable with a gateway-only proxy configuration",
+        "description": "Starts Discord Stable with a dedicated SOCKS5 control route",
         "minimum-os": "win10",
         "execution-level": "as invoker",
         "ui-access": false,
@@ -22,8 +22,8 @@
         "info": {
           "0409": {
             "CompanyName": "Discord Unlocker project",
-            "Comments": "Starts Discord Stable with a PAC limited to Discord gateway hosts. Installs no VPN, driver, service, or resident process.",
-            "FileDescription": "Discord gateway launcher",
+            "Comments": "Starts Discord with a process-only SOCKS5 route while media and UDP remain direct. Installs no VPN, driver, service, or resident process.",
+            "FileDescription": "Discord control-route launcher",
             "InternalName": "discord-unlocker",
             "LegalCopyright": "Copyright (c) 2026",
             "OriginalFilename": "discord-unlocker.exe",

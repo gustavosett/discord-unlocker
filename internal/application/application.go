@@ -9,7 +9,6 @@ import (
 
 	"github.com/gustavosett/discord-unlocker/internal/cache"
 	"github.com/gustavosett/discord-unlocker/internal/discord"
-	"github.com/gustavosett/discord-unlocker/internal/pac"
 	"github.com/gustavosett/discord-unlocker/internal/proxy"
 	"github.com/gustavosett/discord-unlocker/internal/runtimepaths"
 )
@@ -27,8 +26,7 @@ type Resolver interface {
 
 type DiscordController interface {
 	RunningProcesses() ([]discord.ProcessInfo, error)
-	TerminateAll(context.Context, time.Duration) error
-	LaunchWithPAC(context.Context, string, time.Duration) (discord.LaunchResult, error)
+	LaunchWithProxy(context.Context, proxy.Endpoint, time.Duration) (discord.LaunchResult, error)
 	LaunchDirect(context.Context) (discord.LaunchResult, error)
 }
 
@@ -42,6 +40,7 @@ const (
 	ModeChecked           Mode = "checked"
 	ModeProxied           Mode = "proxied"
 	ModeDirect            Mode = "direct"
+	ModeAlreadyRunning    Mode = "already-running"
 	ModeExistingUntouched Mode = "existing-untouched"
 )
 
@@ -49,7 +48,6 @@ type Result struct {
 	Mode       Mode
 	ProxyCount int
 	Fetched    bool
-	Restarted  bool
 	Launch     discord.LaunchResult
 	Reason     error
 }
@@ -62,7 +60,6 @@ type Runner struct {
 	Now              func() time.Time
 	CacheTTL         time.Duration
 	DiscoveryTimeout time.Duration
-	ShutdownTimeout  time.Duration
 	BootstrapWindow  time.Duration
 }
 
@@ -72,11 +69,12 @@ type preparation struct {
 	warning   error
 }
 
-// Run prepares a verified PAC and applies it only after every disk and network
-// step has succeeded. In checkOnly mode it never inspects or restarts Discord.
+// Run prepares a verified per-process SOCKS route and applies it only after
+// every disk and network step has succeeded. In checkOnly mode it never
+// inspects or starts Discord.
 func (runner Runner) Run(ctx context.Context, checkOnly bool) (Result, error) {
-	prepared, prepareErr := runner.prepare(ctx)
 	if checkOnly {
+		prepared, prepareErr := runner.prepare(ctx)
 		if prepareErr != nil {
 			return Result{}, prepareErr
 		}
@@ -90,45 +88,55 @@ func (runner Runner) Run(ctx context.Context, checkOnly bool) (Result, error) {
 	if runner.Discord == nil {
 		return Result{}, errors.New("controlador do Discord não configurado")
 	}
-	if prepareErr != nil {
-		runner.logf("Modo liberado não aplicado: %v", prepareErr)
-		return runner.directOrPreserve(ctx, prepareErr)
-	}
 
+	// A normal shortcut activation must never tear down a session that is
+	// already running. Besides avoiding a surprising restart when the taskbar
+	// icon is clicked again, this makes the launcher unable to interrupt an
+	// active call or stream. To apply the route to an existing direct session,
+	// the user must quit Discord once and reopen it through the managed shortcut.
 	running, err := runner.Discord.RunningProcesses()
 	if err != nil {
 		cause := fmt.Errorf("não foi possível determinar com segurança os processos do Discord: %w", err)
 		runner.logf("%v", cause)
 		return runner.directOrPreserve(ctx, cause)
 	}
-
-	restarted := len(running) != 0
-	if restarted {
-		runner.logf("Encerrando %d processo(s) do Discord Stable antes de aplicar o PAC...", len(running))
-		if err := runner.Discord.TerminateAll(ctx, runner.shutdownTimeout()); err != nil {
-			cause := fmt.Errorf("encerrar Discord antes da inicialização com PAC: %w", err)
-			runner.logf("%v", cause)
-			runner.logf("Não foi possível fechar o Discord automaticamente. Use Alt+F4 com a janela do Discord em foco (ou Sair do Discord no ícone ao lado do relógio) e execute o atalho Discord Unlocker novamente.")
-			// The process state is uncertain after a partial or permission-denied
-			// shutdown. Starting another direct instance could reconnect the existing
-			// client from Brazil and would also undermine the fail-closed boundary.
-			// Preserve whatever remains and let the user close it explicitly.
-			return Result{Mode: ModeExistingUntouched, Reason: cause}, nil
-		}
+	if len(running) != 0 {
+		runner.logf("Discord já está aberto; nenhuma reinicialização foi feita.")
+		return Result{Mode: ModeAlreadyRunning}, nil
 	}
 
-	runner.logf("Abrindo Discord com PAC e %d proxy(s) validada(s)...", len(prepared.endpoints))
-	launch, err := runner.Discord.LaunchWithPAC(ctx, runner.Paths.PACFile, runner.bootstrapWindow())
+	prepared, prepareErr := runner.prepare(ctx)
+	if prepareErr != nil {
+		runner.logf("Modo liberado não aplicado: %v", prepareErr)
+		return runner.directOrPreserve(ctx, prepareErr)
+	}
+
+	// Discovery can take a few seconds. Recheck to avoid racing another Discord
+	// launch and accidentally creating a second bootstrap with different flags.
+	running, err = runner.Discord.RunningProcesses()
 	if err != nil {
-		cause := fmt.Errorf("Discord não sobreviveu ao bootstrap com PAC: %w", err)
+		cause := fmt.Errorf("não foi possível determinar com segurança os processos do Discord: %w", err)
+		runner.logf("%v", cause)
+		return runner.directOrPreserve(ctx, cause)
+	}
+
+	if len(running) != 0 {
+		runner.logf("Discord foi aberto durante a validação; nenhuma reinicialização foi feita.")
+		return Result{Mode: ModeAlreadyRunning}, nil
+	}
+
+	selected := prepared.endpoints[0]
+	runner.logf("Abrindo Discord com rota SOCKS5 dedicada por %s (%s)...", selected.Address(), selected.Country)
+	launch, err := runner.Discord.LaunchWithProxy(ctx, selected, runner.bootstrapWindow())
+	if err != nil {
+		cause := fmt.Errorf("Discord não sobreviveu ao bootstrap com proxy dedicada: %w", err)
 		runner.logf("%v", cause)
 		return runner.directOrPreserve(ctx, cause)
 	}
 	return Result{
 		Mode:       ModeProxied,
-		ProxyCount: len(prepared.endpoints),
+		ProxyCount: 1,
 		Fetched:    prepared.fetched,
-		Restarted:  restarted,
 		Launch:     launch,
 		Reason:     prepared.warning,
 	}, nil
@@ -183,10 +191,9 @@ func (runner Runner) prepare(ctx context.Context) (preparation, error) {
 	}
 
 	cacheEntries := make([]cache.Entry, 0, len(selected))
-	pacEndpoints := make([]pac.Endpoint, 0, len(selected))
 	for _, endpoint := range selected {
-		if endpoint.Port == 0 {
-			return preparation{}, errors.New("resolvedor retornou porta zero")
+		if err := endpoint.Validate(); err != nil {
+			return preparation{}, fmt.Errorf("resolvedor retornou endpoint inválido: %w", err)
 		}
 		cacheEntries = append(cacheEntries, cache.Entry{
 			IP:         endpoint.Host,
@@ -195,13 +202,9 @@ func (runner Runner) prepare(ctx context.Context) (preparation, error) {
 			Latency:    endpoint.Latency,
 			VerifiedAt: endpoint.VerifiedAt,
 		})
-		pacEndpoints = append(pacEndpoints, pac.Endpoint{IP: endpoint.Host, Port: int(endpoint.Port)})
 	}
 	if err := cache.Save(runner.Paths.CacheFile, cacheEntries); err != nil {
 		return preparation{}, fmt.Errorf("salvar cache validado: %w", err)
-	}
-	if err := pac.WriteFile(runner.Paths.PACFile, pacEndpoints); err != nil {
-		return preparation{}, fmt.Errorf("gravar PAC validado: %w", err)
 	}
 
 	return preparation{endpoints: selected, fetched: fetched, warning: resolveErr}, nil
@@ -274,13 +277,6 @@ func (runner Runner) discoveryTimeout() time.Duration {
 	return DefaultDiscoveryTimeout
 }
 
-func (runner Runner) shutdownTimeout() time.Duration {
-	if runner.ShutdownTimeout > 0 {
-		return runner.ShutdownTimeout
-	}
-	return discord.DefaultShutdownTimeout
-}
-
 func (runner Runner) bootstrapWindow() time.Duration {
 	if runner.BootstrapWindow > 0 {
 		return runner.BootstrapWindow
@@ -293,13 +289,11 @@ func Describe(result Result) string {
 	case ModeChecked:
 		return fmt.Sprintf("Pool validado: %d proxy(s) pronta(s).", result.ProxyCount)
 	case ModeProxied:
-		action := "aberto"
-		if result.Restarted {
-			action = "reiniciado"
-		}
-		return fmt.Sprintf("Discord %s com PAC (%d proxy(s) e fallback DIRECT).", action, result.ProxyCount)
+		return "Discord aberto com rota SOCKS5 dedicada; mídia e UDP permanecem diretos."
 	case ModeDirect:
 		return "Discord aberto diretamente; o modo liberado não foi aplicado."
+	case ModeAlreadyRunning:
+		return "Discord já estava aberto; nenhuma reinicialização foi feita."
 	case ModeExistingUntouched:
 		return "Discord já estava aberto e foi mantido intacto; o modo liberado não foi aplicado."
 	default:

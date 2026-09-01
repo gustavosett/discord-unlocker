@@ -2,11 +2,11 @@
 ; O binário precisa existir em ..\dist antes de chamar o ISCC.
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.4-dev"
+  #define MyAppVersion "0.1.5-dev"
 #endif
 
 #ifndef MyAppNumericVersion
-  #define MyAppNumericVersion "0.1.4.0"
+  #define MyAppNumericVersion "0.1.5.0"
 #endif
 
 #define MyAppName "Discord Unlocker"
@@ -15,8 +15,8 @@
 #ifdef SignedBuild
   #define MySetupBaseFilename "discord-unlocker-setup"
 #else
-  ; Keep the exact internal filename used by the best known 3/71 build. The
-  ; build script renames the completed file without modifying its bytes.
+  ; Validation builds are compiled with an explicit unsigned identity. The
+  ; build script gives the completed artifact its public distribution name.
   #define MySetupBaseFilename "discord-unlocker-setup-unsigned"
 #endif
 
@@ -68,6 +68,11 @@ Source: "{localappdata}\Discord\app.ico"; DestDir: "{app}"; DestName: "discord.i
 ; managed Discord shortcuts created in [Code] replace them.
 Type: files; Name: "{userprograms}\Discord Unlocker.lnk"
 Type: files; Name: "{userdesktop}\Discord Unlocker.lnk"
+
+[Run]
+; A post-install checkbox lets the user close Discord only when they choose to.
+; The next normal launch then receives the new per-process proxy arguments.
+Filename: "{sys}\taskkill.exe"; Parameters: "/IM Discord.exe /T /F"; Description: "Encerrar o Discord agora para aplicar a nova inicialização"; Flags: postinstall skipifsilent runhidden
 
 [UninstallDelete]
 ; Installer-state backups are deliberately excluded. [Code] removes them only

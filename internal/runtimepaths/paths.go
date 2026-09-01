@@ -13,7 +13,6 @@ const dataDirectoryName = "Discord Unlocker"
 type Paths struct {
 	DataDir   string
 	CacheFile string
-	PACFile   string
 	LogFile   string
 }
 
@@ -26,7 +25,6 @@ func FromLocalAppData(localAppData string) (Paths, error) {
 	return Paths{
 		DataDir:   dataDir,
 		CacheFile: filepath.Join(dataDir, "proxy-cache-v1.json"),
-		PACFile:   filepath.Join(dataDir, "gateway-proxy.pac"),
 		LogFile:   filepath.Join(dataDir, "discord-unlocker.log"),
 	}, nil
 }

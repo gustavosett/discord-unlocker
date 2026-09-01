@@ -13,7 +13,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/gustavosett/discord-unlocker/internal/pac"
+	"github.com/gustavosett/discord-unlocker/internal/proxy"
 )
 
 const (
@@ -28,43 +28,44 @@ var (
 	procGetExitCodeProcess  = kernel32Process.NewProc("GetExitCodeProcess")
 )
 
-// LaunchWithPAC starts Discord.exe directly with an embedded data: PAC URL and waits
-// until that exact process has survived bootstrapWindow. It refuses to start
+// LaunchWithProxy starts Discord.exe directly with a validated SOCKS5 endpoint
+// and a Chromium bypass list that keeps media and storage traffic direct. It
+// waits until that exact process has survived bootstrapWindow, refuses to start
 // while Stable is already running and never terminates an existing process.
 //
 // Cancelling ctx only cancels the survival check; it does not kill the newly
 // started Discord process. The returned LaunchResult identifies that process
 // even when the wait is cancelled.
-func (client *Client) LaunchWithPAC(
+func (client *Client) LaunchWithProxy(
 	ctx context.Context,
-	pacPath string,
+	endpoint proxy.Endpoint,
 	bootstrapWindow time.Duration,
 ) (LaunchResult, error) {
 	if err := ctx.Err(); err != nil {
-		return LaunchResult{}, fmt.Errorf("launch Discord with PAC: %w", err)
+		return LaunchResult{}, fmt.Errorf("launch Discord with proxy: %w", err)
+	}
+
+	arguments, err := chromiumProxyArguments(endpoint)
+	if err != nil {
+		return LaunchResult{}, fmt.Errorf("launch Discord with proxy: %w", err)
 	}
 
 	running, err := client.RunningProcesses()
 	if err != nil {
-		return LaunchResult{}, fmt.Errorf("launch Discord with PAC: detect running processes: %w", err)
+		return LaunchResult{}, fmt.Errorf("launch Discord with proxy: detect running processes: %w", err)
 	}
 	if len(running) != 0 {
 		return LaunchResult{}, fmt.Errorf(
-			"%w (PIDs %s); call TerminateAll explicitly before PAC launch",
+			"%w (PIDs %s); close Discord before proxy launch",
 			ErrDiscordRunning,
 			formatProcessPIDs(running),
 		)
 	}
 
-	pacURL, err := pac.FileDataURL(pacPath)
-	if err != nil {
-		return LaunchResult{}, fmt.Errorf("launch Discord with PAC: %w", err)
-	}
 	if bootstrapWindow <= 0 {
 		bootstrapWindow = DefaultBootstrapWindow
 	}
 
-	arguments := []string{"--proxy-pac-url=" + pacURL}
 	// Do not set STARTF_USESHOWWINDOW/SW_HIDE for Discord.exe: that also hides
 	// Electron's main window. A windowsgui launcher does not create a child
 	// console that needs suppressing here.
@@ -72,7 +73,7 @@ func (client *Client) LaunchWithPAC(
 	command.Dir = client.installation.AppDir
 	if err := command.Start(); err != nil {
 		return LaunchResult{}, fmt.Errorf(
-			"start Discord executable %q with embedded PAC: %w",
+			"start Discord executable %q with dedicated proxy: %w",
 			client.installation.DiscordExe,
 			err,
 		)

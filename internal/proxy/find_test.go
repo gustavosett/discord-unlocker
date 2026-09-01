@@ -28,20 +28,21 @@ import (
 
 func TestFindAndResolveValidateTraceGatewayAndCache(t *testing.T) {
 	t.Parallel()
-	certificate, roots := testServerCertificate(t, "trace.test", "gateway.test")
+	certificate, roots := testServerCertificate(t, "trace.test", "gateway.test", "api.test")
 	traceUS := startTraceServer(t, certificate, "US")
 	traceBR := startTraceServer(t, certificate, "BR")
 	gateway := startGatewayServer(t, certificate)
+	discordAPI := startDiscordAPIServer(t, certificate, http.StatusOK, `{"url":"wss://gateway.discord.gg"}`)
 
 	type candidate struct {
 		endpoint Endpoint
 		proxy    string
 	}
 	candidates := []candidate{
-		{endpoint: Endpoint{Host: "1.1.1.1", Port: 1001}, proxy: startSOCKS5Relay(t, traceUS, gateway, 5*time.Millisecond)},
-		{endpoint: Endpoint{Host: "9.9.9.9", Port: 1002}, proxy: startSOCKS5Relay(t, traceUS, gateway, 30*time.Millisecond)},
-		{endpoint: Endpoint{Host: "8.8.8.8", Port: 1003}, proxy: startSOCKS5Relay(t, traceUS, gateway, 60*time.Millisecond)},
-		{endpoint: Endpoint{Host: "208.67.222.222", Port: 1004}, proxy: startSOCKS5Relay(t, traceBR, gateway, time.Millisecond)},
+		{endpoint: Endpoint{Host: "1.1.1.1", Port: 1001}, proxy: startSOCKS5Relay(t, traceUS, gateway, discordAPI, 5*time.Millisecond)},
+		{endpoint: Endpoint{Host: "9.9.9.9", Port: 1002}, proxy: startSOCKS5Relay(t, traceUS, gateway, discordAPI, 30*time.Millisecond)},
+		{endpoint: Endpoint{Host: "8.8.8.8", Port: 1003}, proxy: startSOCKS5Relay(t, traceUS, gateway, discordAPI, 60*time.Millisecond)},
+		{endpoint: Endpoint{Host: "208.67.222.222", Port: 1004}, proxy: startSOCKS5Relay(t, traceBR, gateway, discordAPI, time.Millisecond)},
 	}
 	mapped := make(map[string]string, len(candidates))
 	lines := []string{"127.0.0.1:9", "not-a-proxy"}
@@ -64,12 +65,14 @@ func TestFindAndResolveValidateTraceGatewayAndCache(t *testing.T) {
 		SourceURL:         source.URL,
 		TraceURL:          "https://trace.test/cdn-cgi/trace",
 		GatewayAddress:    "gateway.test:443",
+		DiscordAPIURL:     "https://api.test/api/v9/gateway",
 		HTTPClient:        source.Client(),
 		DialContext:       mappedDialer(mapped),
 		TLSConfig:         &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
 		Shuffle:           func([]Endpoint) error { return nil },
 		ValidationTimeout: 3 * time.Second,
 		FetchTimeout:      time.Second,
+		ResultLimit:       3,
 		Now:               func() time.Time { return fixedNow },
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -191,7 +194,7 @@ func TestVerifyRequiresRealGatewayWebSocketUpgrade(t *testing.T) {
 	trace := startTraceServer(t, certificate, "US")
 	gateway := startRejectedGatewayServer(t, certificate)
 	endpoint := Endpoint{Host: "8.8.8.8", Port: 1080}
-	proxyAddress := startSOCKS5Relay(t, trace, gateway, time.Millisecond)
+	proxyAddress := startSOCKS5Relay(t, trace, gateway, "", time.Millisecond)
 
 	_, err := Verify(context.Background(), endpoint, Options{
 		TraceURL:          "https://trace.test/cdn-cgi/trace",
@@ -205,13 +208,98 @@ func TestVerifyRequiresRealGatewayWebSocketUpgrade(t *testing.T) {
 	}
 }
 
-func TestResolvePreservesValidCacheWhenFetchFailsAndRejectsUntrustedCertificate(t *testing.T) {
+func TestVerifyRequiresExpectedDiscordGatewayAPIResponse(t *testing.T) {
 	t.Parallel()
-	certificate, roots := testServerCertificate(t, "trace.test", "gateway.test")
+	certificate, roots := testServerCertificate(t, "trace.test", "gateway.test", "api.test")
 	trace := startTraceServer(t, certificate, "US")
 	gateway := startGatewayServer(t, certificate)
+
+	tests := []struct {
+		name      string
+		status    int
+		body      string
+		bodyLimit int64
+		wantError string
+	}{
+		{
+			name:      "non-200 status",
+			status:    http.StatusForbidden,
+			body:      `{"message":"forbidden"}`,
+			wantError: "Discord API returned HTTP 403",
+		},
+		{
+			name:      "malformed JSON",
+			status:    http.StatusOK,
+			body:      `{"url":`,
+			wantError: "invalid Discord API response",
+		},
+		{
+			name:      "unexpected gateway",
+			status:    http.StatusOK,
+			body:      `{"url":"wss://example.test"}`,
+			wantError: "unexpected Gateway URL",
+		},
+		{
+			name:      "oversized body",
+			status:    http.StatusOK,
+			body:      `{"url":"wss://gateway.discord.gg","padding":"0123456789"}`,
+			bodyLimit: 16,
+			wantError: ErrResponseTooLarge.Error(),
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			discordAPI := startDiscordAPIServer(t, certificate, test.status, test.body)
+			endpoint := Endpoint{Host: "8.8.8.8", Port: 1080}
+			proxyAddress := startSOCKS5Relay(t, trace, gateway, discordAPI, time.Millisecond)
+			_, err := Verify(context.Background(), endpoint, Options{
+				TraceURL:            "https://trace.test/cdn-cgi/trace",
+				GatewayAddress:      "gateway.test:443",
+				DiscordAPIURL:       "https://api.test/api/v9/gateway",
+				DiscordAPIBodyBytes: test.bodyLimit,
+				DialContext:         mappedDialer(map[string]string{endpoint.Address(): proxyAddress}),
+				TLSConfig:           &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
+				ValidationTimeout:   2 * time.Second,
+			})
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("Verify() error = %v, want substring %q", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestVerifyRejectsUntrustedDiscordAPICertificate(t *testing.T) {
+	t.Parallel()
+	trustedCertificate, trustedRoots := testServerCertificate(t, "trace.test", "gateway.test")
+	untrustedCertificate, _ := testServerCertificate(t, "api.test")
+	trace := startTraceServer(t, trustedCertificate, "US")
+	gateway := startGatewayServer(t, trustedCertificate)
+	discordAPI := startDiscordAPIServer(t, untrustedCertificate, http.StatusOK, `{"url":"wss://gateway.discord.gg"}`)
 	endpoint := Endpoint{Host: "8.8.4.4", Port: 1080}
-	proxyAddress := startSOCKS5Relay(t, trace, gateway, 2*time.Millisecond)
+	proxyAddress := startSOCKS5Relay(t, trace, gateway, discordAPI, time.Millisecond)
+
+	_, err := Verify(context.Background(), endpoint, Options{
+		TraceURL:          "https://trace.test/cdn-cgi/trace",
+		GatewayAddress:    "gateway.test:443",
+		DiscordAPIURL:     "https://api.test/api/v9/gateway",
+		DialContext:       mappedDialer(map[string]string{endpoint.Address(): proxyAddress}),
+		TLSConfig:         &tls.Config{RootCAs: trustedRoots, MinVersion: tls.VersionTLS12},
+		ValidationTimeout: 2 * time.Second,
+	})
+	if err == nil || !strings.Contains(err.Error(), "Discord API") {
+		t.Fatalf("Verify() error = %v, want Discord API TLS rejection", err)
+	}
+}
+
+func TestResolvePreservesValidCacheWhenFetchFailsAndRejectsUntrustedCertificate(t *testing.T) {
+	t.Parallel()
+	certificate, roots := testServerCertificate(t, "trace.test", "gateway.test", "api.test")
+	trace := startTraceServer(t, certificate, "US")
+	gateway := startGatewayServer(t, certificate)
+	discordAPI := startDiscordAPIServer(t, certificate, http.StatusOK, `{"url":"wss://gateway.discord.gg"}`)
+	endpoint := Endpoint{Host: "8.8.4.4", Port: 1080}
+	proxyAddress := startSOCKS5Relay(t, trace, gateway, discordAPI, 2*time.Millisecond)
 	source := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		http.Error(writer, "unavailable", http.StatusServiceUnavailable)
 	}))
@@ -220,12 +308,14 @@ func TestResolvePreservesValidCacheWhenFetchFailsAndRejectsUntrustedCertificate(
 		SourceURL:         source.URL,
 		TraceURL:          "https://trace.test/cdn-cgi/trace",
 		GatewayAddress:    "gateway.test:443",
+		DiscordAPIURL:     "https://api.test/api/v9/gateway",
 		HTTPClient:        source.Client(),
 		DialContext:       mappedDialer(map[string]string{endpoint.Address(): proxyAddress}),
 		TLSConfig:         &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
 		Shuffle:           func([]Endpoint) error { return nil },
 		ValidationTimeout: 2 * time.Second,
 		FetchTimeout:      time.Second,
+		ResultLimit:       2,
 	}
 	selected, fetched, err := (Resolver{Options: base}).Resolve(context.Background(), []Endpoint{endpoint}, nil)
 	if err == nil || !fetched {
@@ -332,7 +422,7 @@ func mappedDialer(mapping map[string]string) DialContextFunc {
 	}
 }
 
-func startSOCKS5Relay(t *testing.T, traceAddress, gatewayAddress string, delay time.Duration) string {
+func startSOCKS5Relay(t *testing.T, traceAddress, gatewayAddress, discordAPIAddress string, delay time.Duration) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -345,13 +435,13 @@ func startSOCKS5Relay(t *testing.T, traceAddress, gatewayAddress string, delay t
 			if acceptErr != nil {
 				return
 			}
-			go handleSOCKS5Relay(connection, traceAddress, gatewayAddress, delay)
+			go handleSOCKS5Relay(connection, traceAddress, gatewayAddress, discordAPIAddress, delay)
 		}
 	}()
 	return listener.Addr().String()
 }
 
-func handleSOCKS5Relay(connection net.Conn, traceAddress, gatewayAddress string, delay time.Duration) {
+func handleSOCKS5Relay(connection net.Conn, traceAddress, gatewayAddress, discordAPIAddress string, delay time.Duration) {
 	defer connection.Close()
 	_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
 	header := make([]byte, 2)
@@ -379,6 +469,8 @@ func handleSOCKS5Relay(connection net.Conn, traceAddress, gatewayAddress string,
 		target = traceAddress
 	case "gateway.test:443":
 		target = gatewayAddress
+	case "api.test:443":
+		target = discordAPIAddress
 	default:
 		_ = writeAll(connection, []byte{0x05, 0x04, 0x00, 0x01})
 		return
@@ -415,6 +507,30 @@ func startTraceServer(t *testing.T, certificate tls.Certificate, country string)
 	server := &http.Server{
 		Handler: http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 			_, _ = fmt.Fprintf(writer, "fl=test\nloc=%s\ntls=TLSv1.3\n", country)
+		}),
+		ReadHeaderTimeout: time.Second,
+	}
+	tlsListener := tls.NewListener(listener, &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12})
+	t.Cleanup(func() { _ = server.Close() })
+	go func() { _ = server.Serve(tlsListener) }()
+	return listener.Addr().String()
+}
+
+func startDiscordAPIServer(t *testing.T, certificate tls.Certificate, status int, body string) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen Discord API server: %v", err)
+	}
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.URL.Path != "/api/v9/gateway" {
+				http.NotFound(writer, request)
+				return
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(status)
+			_, _ = io.WriteString(writer, body)
 		}),
 		ReadHeaderTimeout: time.Second,
 	}

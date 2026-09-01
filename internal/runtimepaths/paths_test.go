@@ -15,7 +15,7 @@ func TestFromLocalAppData(t *testing.T) {
 	if got.DataDir != wantDir {
 		t.Fatalf("DataDir = %q, want %q", got.DataDir, wantDir)
 	}
-	if filepath.Dir(got.PACFile) != wantDir || filepath.Dir(got.CacheFile) != wantDir || filepath.Dir(got.LogFile) != wantDir {
+	if filepath.Dir(got.CacheFile) != wantDir || filepath.Dir(got.LogFile) != wantDir {
 		t.Fatalf("arquivos escaparam da pasta de dados: %#v", got)
 	}
 }

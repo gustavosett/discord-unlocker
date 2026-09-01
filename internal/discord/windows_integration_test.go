@@ -3,13 +3,9 @@
 package discord
 
 import (
-	"context"
 	"errors"
 	"os"
-	"path/filepath"
-	"strings"
 	"testing"
-	"time"
 )
 
 func TestTakeProcessSnapshotIncludesCurrentProcess(t *testing.T) {
@@ -63,74 +59,4 @@ func TestRunningProcessesForInstalledStable(t *testing.T) {
 			t.Fatalf("RunningProcesses() returned non-Stable image %q", process.ImagePath)
 		}
 	}
-}
-
-func TestTerminateAllHonorsCancelledContextBeforeDiscovery(t *testing.T) {
-	client := newTestClient(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := client.TerminateAll(ctx, time.Second); !errors.Is(err, context.Canceled) {
-		t.Fatalf("TerminateAll() error = %v, want context.Canceled", err)
-	}
-}
-
-func TestWaitForProcessReleaseRetriesTransientInspectionError(t *testing.T) {
-	transientErr := errors.New("process is disappearing")
-	calls := 0
-	err := waitForProcessRelease(context.Background(), time.Millisecond, func() ([]ProcessInfo, error) {
-		calls++
-		if calls == 1 {
-			return nil, transientErr
-		}
-		return nil, nil
-	})
-	if err != nil {
-		t.Fatalf("waitForProcessRelease() error = %v", err)
-	}
-	if calls != 2 {
-		t.Fatalf("waitForProcessRelease() calls = %d, want 2", calls)
-	}
-}
-
-func TestWaitForProcessReleaseReportsPersistentInspectionErrorAtDeadline(t *testing.T) {
-	inspectionErr := errors.New("access denied while process exits")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-
-	err := waitForProcessRelease(ctx, time.Millisecond, func() ([]ProcessInfo, error) {
-		return []ProcessInfo{{PID: 1234}}, inspectionErr
-	})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("waitForProcessRelease() error = %v, want context.DeadlineExceeded", err)
-	}
-	if !strings.Contains(err.Error(), "remaining PIDs 1234") ||
-		!strings.Contains(err.Error(), inspectionErr.Error()) {
-		t.Fatalf("waitForProcessRelease() error = %q, want PID and inspection detail", err)
-	}
-}
-
-func TestProcessRevalidationRejectsChangedImage(t *testing.T) {
-	client := newTestClient(t)
-	handle, stable, err := client.openVerifiedStableProcess(uint32(os.Getpid()))
-	if handle != 0 {
-		procCloseHandleProcess.Call(handle)
-		t.Fatalf("openVerifiedStableProcess() returned unexpected handle %#x", handle)
-	}
-	if stable || err == nil {
-		t.Fatalf("openVerifiedStableProcess() = (%#x, %v, %v), want changed-image error", handle, stable, err)
-	}
-}
-
-func newTestClient(t *testing.T) *Client {
-	t.Helper()
-	root := filepath.Join(t.TempDir(), "Discord")
-	client, err := NewClient(Installation{
-		RootDir:    root,
-		AppDir:     filepath.Join(root, "app-1.0.0"),
-		DiscordExe: filepath.Join(root, "app-1.0.0", "Discord.exe"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return client
 }

@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/gustavosett/discord-unlocker/internal/pac"
+	"github.com/gustavosett/discord-unlocker/internal/proxy"
 )
 
 const (
@@ -192,8 +194,11 @@ func fromDisk(stored diskEntry, now time.Time, ttl time.Duration) (Entry, bool) 
 }
 
 func normalize(entry Entry) (Entry, bool) {
-	endpoint, err := pac.NewEndpoint(entry.IP, entry.Port)
-	if err != nil {
+	if entry.Port < 1 || entry.Port > 65535 {
+		return Entry{}, false
+	}
+	endpoint, valid := proxy.SanitizeEndpoint(net.JoinHostPort(entry.IP, strconv.Itoa(entry.Port)))
+	if !valid {
 		return Entry{}, false
 	}
 	country := strings.ToUpper(strings.TrimSpace(entry.Country))
@@ -203,8 +208,8 @@ func normalize(entry Entry) (Entry, bool) {
 	if entry.Latency < time.Millisecond || entry.Latency > time.Minute || entry.VerifiedAt.IsZero() {
 		return Entry{}, false
 	}
-	entry.IP = endpoint.IP
-	entry.Port = endpoint.Port
+	entry.IP = endpoint.Host
+	entry.Port = int(endpoint.Port)
 	entry.Country = country
 	entry.Latency = entry.Latency.Round(time.Millisecond)
 	entry.VerifiedAt = entry.VerifiedAt.UTC()

@@ -16,15 +16,17 @@ const (
 	errorInvalidHandle  = syscall.Errno(6)
 	stdOutputHandle     = ^uint32(10) // (DWORD)-11
 	stdErrorHandle      = ^uint32(11) // (DWORD)-12
+	utf8CodePage        = 65001
 )
 
 var (
-	kernel32Console      = syscall.NewLazyDLL("kernel32.dll")
-	procGetConsoleWindow = kernel32Console.NewProc("GetConsoleWindow")
-	procAttachConsole    = kernel32Console.NewProc("AttachConsole")
-	procAllocConsole     = kernel32Console.NewProc("AllocConsole")
-	procFreeConsole      = kernel32Console.NewProc("FreeConsole")
-	procSetStdHandle     = kernel32Console.NewProc("SetStdHandle")
+	kernel32Console        = syscall.NewLazyDLL("kernel32.dll")
+	procGetConsoleWindow   = kernel32Console.NewProc("GetConsoleWindow")
+	procAttachConsole      = kernel32Console.NewProc("AttachConsole")
+	procAllocConsole       = kernel32Console.NewProc("AllocConsole")
+	procFreeConsole        = kernel32Console.NewProc("FreeConsole")
+	procSetStdHandle       = kernel32Console.NewProc("SetStdHandle")
+	procSetConsoleOutputCP = kernel32Console.NewProc("SetConsoleOutputCP")
 )
 
 // PrepareConsole configures a binary linked with -H=windowsgui. Silent mode
@@ -49,6 +51,9 @@ func PrepareConsole(silent bool) error {
 				)
 			}
 		}
+	}
+	if result, _, codePageErr := procSetConsoleOutputCP.Call(utf8CodePage); result == 0 {
+		return fmt.Errorf("set console output to UTF-8: %w", normalizeWinutilError(codePageErr))
 	}
 	return reopenConsoleOutput()
 }

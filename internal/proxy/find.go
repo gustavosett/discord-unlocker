@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,44 +22,50 @@ import (
 )
 
 const (
-	DefaultTraceURL          = "https://www.cloudflare.com/cdn-cgi/trace"
-	DefaultGatewayAddress    = "gateway.discord.gg:443"
-	DefaultWorkers           = 8
-	MaxWorkers               = 8
-	DefaultResultLimit       = 3
-	MaxResults               = 3
-	DefaultFetchTimeout      = 10 * time.Second
-	DefaultValidationTimeout = 8 * time.Second
-	DefaultTraceBodyLimit    = int64(8 << 10)
-	MaxTraceBodyLimit        = int64(64 << 10)
+	DefaultTraceURL            = "https://www.cloudflare.com/cdn-cgi/trace"
+	DefaultGatewayAddress      = "gateway.discord.gg:443"
+	DefaultDiscordAPIURL       = "https://discord.com/api/v9/gateway"
+	DefaultWorkers             = 8
+	MaxWorkers                 = 8
+	DefaultResultLimit         = 1
+	MaxResults                 = 3
+	DefaultFetchTimeout        = 10 * time.Second
+	DefaultValidationTimeout   = 8 * time.Second
+	DefaultTraceBodyLimit      = int64(8 << 10)
+	MaxTraceBodyLimit          = int64(64 << 10)
+	DefaultDiscordAPIBodyLimit = int64(8 << 10)
+	MaxDiscordAPIBodyLimit     = int64(64 << 10)
 )
 
 // Options controls discovery. Its zero value is ready for production use.
 // The injectable fields make network behavior deterministic in tests without
 // weakening TLS verification.
 type Options struct {
-	SourceURL         string
-	TraceURL          string
-	GatewayAddress    string
-	HTTPClient        *http.Client
-	DialContext       DialContextFunc
-	TLSConfig         *tls.Config
-	Shuffle           ShuffleFunc
-	MaxBodyBytes      int64
-	TraceBodyBytes    int64
-	CandidateLimit    int
-	WorkerCount       int
-	ResultLimit       int
-	FetchTimeout      time.Duration
-	ValidationTimeout time.Duration
-	Now               func() time.Time
+	SourceURL           string
+	TraceURL            string
+	GatewayAddress      string
+	DiscordAPIURL       string
+	HTTPClient          *http.Client
+	DialContext         DialContextFunc
+	TLSConfig           *tls.Config
+	Shuffle             ShuffleFunc
+	MaxBodyBytes        int64
+	TraceBodyBytes      int64
+	DiscordAPIBodyBytes int64
+	CandidateLimit      int
+	WorkerCount         int
+	ResultLimit         int
+	FetchTimeout        time.Duration
+	ValidationTimeout   time.Duration
+	Now                 func() time.Time
 }
 
 type finderConfig struct {
 	Options
-	traceURL    *url.URL
-	gatewayHost string
-	gatewayPort uint16
+	traceURL      *url.URL
+	discordAPIURL *url.URL
+	gatewayHost   string
+	gatewayPort   uint16
 }
 
 type verificationResult struct {
@@ -92,14 +99,14 @@ type Resolver struct {
 }
 
 // Find fetches at most 40 candidates, checks them using up to eight workers,
-// and returns at most three verified endpoints ordered by measured latency.
+// and returns the fastest verified endpoint by default.
 func Find(ctx context.Context, options Options) ([]Endpoint, error) {
 	selected, _, err := (Resolver{Options: options}).Resolve(ctx, nil, nil)
 	return selected, err
 }
 
 // Resolve uses production defaults. It revalidates cached endpoints first and
-// fetches ProxyScrape at most once if fewer than three cached endpoints pass.
+// fetches ProxyScrape at most once if the configured result count is not met.
 func Resolve(ctx context.Context, cached []Endpoint, progress ProgressFunc) (
 	selected []Endpoint,
 	fetched bool,
@@ -278,6 +285,9 @@ func (config finderConfig) verify(ctx context.Context, endpoint Endpoint) (Endpo
 	if err := config.verifyGatewayTLS(validationContext, endpoint); err != nil {
 		return Endpoint{}, err
 	}
+	if err := config.verifyDiscordAPI(validationContext, endpoint); err != nil {
+		return Endpoint{}, err
+	}
 
 	endpoint.Country = country
 	endpoint.Latency = time.Since(started)
@@ -350,6 +360,65 @@ func (config finderConfig) verifyGatewayTLS(ctx context.Context, endpoint Endpoi
 	return verifyGatewayWebSocket(tlsConnection, config.gatewayHost)
 }
 
+func (config finderConfig) verifyDiscordAPI(ctx context.Context, endpoint Endpoint) error {
+	transport := &http.Transport{
+		Proxy:                  nil,
+		DisableKeepAlives:      true,
+		ForceAttemptHTTP2:      false,
+		TLSClientConfig:        tlsConfigForHost(config.TLSConfig, config.discordAPIURL.Hostname()),
+		TLSHandshakeTimeout:    config.ValidationTimeout,
+		ResponseHeaderTimeout:  config.ValidationTimeout,
+		MaxResponseHeaderBytes: 16 << 10,
+		DialContext: func(dialContext context.Context, _, address string) (net.Conn, error) {
+			return dialSOCKS5(dialContext, config.DialContext, endpoint, address)
+		},
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{
+		Transport: transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return errors.New("proxy: Discord API redirect refused")
+		},
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, config.discordAPIURL.String(), nil)
+	if err != nil {
+		return fmt.Errorf("proxy: create Discord API request: %w", err)
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", "discord-unlocker/1")
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("proxy: Discord API: %w", err)
+	}
+	defer response.Body.Close()
+	if response.TLS == nil || !response.TLS.HandshakeComplete || len(response.TLS.VerifiedChains) == 0 {
+		return errors.New("proxy: Discord API TLS was not verified")
+	}
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("proxy: Discord API returned HTTP %d", response.StatusCode)
+	}
+	if response.ContentLength > config.DiscordAPIBodyBytes {
+		return ErrResponseTooLarge
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, config.DiscordAPIBodyBytes+1))
+	if err != nil {
+		return fmt.Errorf("proxy: read Discord API response: %w", err)
+	}
+	if int64(len(body)) > config.DiscordAPIBodyBytes {
+		return ErrResponseTooLarge
+	}
+	var payload struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return fmt.Errorf("proxy: invalid Discord API response: %w", err)
+	}
+	if payload.URL != "wss://gateway.discord.gg" {
+		return errors.New("proxy: Discord API returned an unexpected Gateway URL")
+	}
+	return nil
+}
+
 // verifyGatewayWebSocket proves that the exit can reach the actual Gateway
 // protocol, rather than merely a TLS terminator which later refuses the
 // request. The response is bounded even though its certificate was verified.
@@ -416,6 +485,9 @@ func normalizeOptions(options Options) (finderConfig, error) {
 	if options.GatewayAddress == "" {
 		options.GatewayAddress = DefaultGatewayAddress
 	}
+	if options.DiscordAPIURL == "" {
+		options.DiscordAPIURL = DefaultDiscordAPIURL
+	}
 	if options.HTTPClient == nil {
 		options.HTTPClient = http.DefaultClient
 	}
@@ -450,6 +522,12 @@ func normalizeOptions(options Options) (finderConfig, error) {
 	if options.TraceBodyBytes > MaxTraceBodyLimit {
 		options.TraceBodyBytes = MaxTraceBodyLimit
 	}
+	if options.DiscordAPIBodyBytes <= 0 {
+		options.DiscordAPIBodyBytes = DefaultDiscordAPIBodyLimit
+	}
+	if options.DiscordAPIBodyBytes > MaxDiscordAPIBodyLimit {
+		options.DiscordAPIBodyBytes = MaxDiscordAPIBodyLimit
+	}
 	if options.CandidateLimit <= 0 || options.CandidateLimit > MaxCandidates {
 		options.CandidateLimit = MaxCandidates
 	}
@@ -474,6 +552,11 @@ func normalizeOptions(options Options) (finderConfig, error) {
 		traceURL.Fragment != "" || !validDNSName(strings.TrimSuffix(traceURL.Hostname(), ".")) {
 		return finderConfig{}, errors.New("proxy: invalid HTTPS trace URL")
 	}
+	discordAPIURL, err := url.Parse(options.DiscordAPIURL)
+	if err != nil || discordAPIURL.Scheme != "https" || discordAPIURL.Host == "" || discordAPIURL.User != nil ||
+		discordAPIURL.Fragment != "" || !validDNSName(strings.TrimSuffix(discordAPIURL.Hostname(), ".")) {
+		return finderConfig{}, errors.New("proxy: invalid Discord API HTTPS URL")
+	}
 	gatewayHost, gatewayPortText, err := net.SplitHostPort(options.GatewayAddress)
 	if err != nil || !validDNSName(strings.TrimSuffix(gatewayHost, ".")) {
 		return finderConfig{}, errors.New("proxy: invalid Discord Gateway address")
@@ -484,10 +567,11 @@ func normalizeOptions(options Options) (finderConfig, error) {
 	}
 
 	return finderConfig{
-		Options:     options,
-		traceURL:    traceURL,
-		gatewayHost: strings.TrimSuffix(strings.ToLower(gatewayHost), "."),
-		gatewayPort: uint16(gatewayPort),
+		Options:       options,
+		traceURL:      traceURL,
+		discordAPIURL: discordAPIURL,
+		gatewayHost:   strings.TrimSuffix(strings.ToLower(gatewayHost), "."),
+		gatewayPort:   uint16(gatewayPort),
 	}, nil
 }
 

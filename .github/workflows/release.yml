@@ -30,7 +30,7 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $version = if ('${{ github.ref }}' -match '^refs/tags/v(.+)$') { $Matches[1] } else { "0.1.4-ci.${{ github.run_number }}" }
+          $version = if ('${{ github.ref }}' -match '^refs/tags/v(.+)$') { $Matches[1] } else { "0.1.5-ci.${{ github.run_number }}" }
           "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Instalar Inno Setup 6.7.3 verificado

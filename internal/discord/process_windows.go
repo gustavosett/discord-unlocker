@@ -3,16 +3,13 @@
 package discord
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 	"unsafe"
 )
 
@@ -121,149 +118,6 @@ func (client *Client) RunningProcesses() ([]ProcessInfo, error) {
 	return processes, nil
 }
 
-// TerminateAll forcefully terminates the complete process tree rooted at every
-// running Discord Stable main process and then waits until no Stable
-// Discord.exe remains. It is intentionally explicit: no other Client method
-// calls it implicitly.
-func (client *Client) TerminateAll(ctx context.Context, timeout time.Duration) error {
-	if timeout <= 0 {
-		timeout = DefaultShutdownTimeout
-	}
-	terminateCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	if err := terminateCtx.Err(); err != nil {
-		return fmt.Errorf("terminate Discord process tree: %w", err)
-	}
-
-	processes, err := client.RunningProcesses()
-	if err != nil {
-		return fmt.Errorf("detect Discord processes before termination: %w", err)
-	}
-	if err := terminateCtx.Err(); err != nil {
-		return fmt.Errorf("detect Discord processes before termination: %w", err)
-	}
-	if len(processes) == 0 {
-		return nil
-	}
-
-	matchingPIDs := make(map[uint32]struct{}, len(processes))
-	for _, process := range processes {
-		matchingPIDs[process.PID] = struct{}{}
-	}
-	roots := make([]ProcessInfo, 0, len(processes))
-	for _, process := range processes {
-		if _, parentIsDiscord := matchingPIDs[process.ParentPID]; !parentIsDiscord {
-			roots = append(roots, process)
-		}
-	}
-
-	var terminationErrors []error
-	for _, root := range roots {
-		if err := terminateCtx.Err(); err != nil {
-			return fmt.Errorf("terminate Discord process tree: %w", err)
-		}
-
-		// Keep a handle to the revalidated process open through taskkill. Windows
-		// does not reuse the PID while the process object is retained by this
-		// handle, closing the snapshot-to-taskkill PID-reuse race.
-		processHandle, stillStable, verifyErr := client.openVerifiedStableProcess(root.PID)
-		if verifyErr != nil {
-			return verifyErr
-		}
-		if !stillStable {
-			continue
-		}
-		command := exec.CommandContext(
-			terminateCtx,
-			"taskkill.exe",
-			"/PID", strconv.FormatUint(uint64(root.PID), 10),
-			"/T",
-			"/F",
-		)
-		command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-		output, commandErr := command.CombinedOutput()
-		procCloseHandleProcess.Call(processHandle)
-		if commandErr != nil {
-			terminationErrors = append(terminationErrors, fmt.Errorf(
-				"taskkill Discord root PID %d: %w (output: %s)",
-				root.PID,
-				commandErr,
-				strings.TrimSpace(string(output)),
-			))
-		}
-	}
-
-	waitErr := client.WaitForExit(terminateCtx, timeout)
-	if waitErr == nil {
-		// A process may exit between discovery and taskkill. In that case taskkill
-		// reports an error even though the requested final state was reached.
-		return nil
-	}
-	if len(terminationErrors) == 0 {
-		return waitErr
-	}
-	terminationErrors = append(terminationErrors, waitErr)
-	return errors.Join(terminationErrors...)
-}
-
-// WaitForExit waits until every Discord Stable process has exited. A zero or
-// negative timeout uses DefaultShutdownTimeout.
-func (client *Client) WaitForExit(ctx context.Context, timeout time.Duration) error {
-	if timeout <= 0 {
-		timeout = DefaultShutdownTimeout
-	}
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	return waitForProcessRelease(waitCtx, 100*time.Millisecond, client.RunningProcesses)
-}
-
-func waitForProcessRelease(
-	ctx context.Context,
-	pollInterval time.Duration,
-	list func() ([]ProcessInfo, error),
-) error {
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
-	var lastProcesses []ProcessInfo
-	var lastInspectionErr error
-	for {
-		processes, err := list()
-		lastProcesses = processes
-		if err == nil && len(processes) == 0 {
-			return nil
-		}
-		if err != nil {
-			// A process killed by taskkill may remain in the Toolhelp snapshot for
-			// a few milliseconds while QueryFullProcessImageName already returns
-			// ACCESS_DENIED or ERROR_GEN_FAILURE. Detection before termination is
-			// intentionally strict; during this read-only wait we retry until the
-			// process disappears or the overall shutdown deadline expires.
-			lastInspectionErr = err
-		} else {
-			lastInspectionErr = nil
-		}
-
-		select {
-		case <-ctx.Done():
-			detail := ""
-			if len(lastProcesses) != 0 {
-				detail = "remaining PIDs " + formatProcessPIDs(lastProcesses)
-			}
-			if lastInspectionErr != nil {
-				if detail != "" {
-					detail += "; "
-				}
-				detail += "last inspection error: " + lastInspectionErr.Error()
-			}
-			if detail == "" {
-				detail = "process state did not settle"
-			}
-			return fmt.Errorf("wait for Discord process release (%s): %w", detail, ctx.Err())
-		case <-ticker.C:
-		}
-	}
-}
-
 func takeProcessSnapshot() ([]snapshotProcess, error) {
 	handle, _, callErr := procCreateToolhelp32Snapshot.Call(th32csSnapProcess, 0)
 	if handle == invalidHandle {
@@ -323,49 +177,6 @@ func queryProcessImagePathFromHandle(handle uintptr) (string, error) {
 		return "", normalizedWindowsError(queryErr)
 	}
 	return syscall.UTF16ToString(buffer[:length]), nil
-}
-
-func (client *Client) openVerifiedStableProcess(pid uint32) (uintptr, bool, error) {
-	handle, _, openErr := procOpenProcess.Call(
-		processSynchronize|processQueryLimitedInformation,
-		0,
-		uintptr(pid),
-	)
-	if handle == 0 {
-		err := normalizedWindowsError(openErr)
-		if processHasGone(err) {
-			return 0, false, nil
-		}
-		return 0, false, fmt.Errorf("revalidate Discord root PID %d: open process: %w", pid, err)
-	}
-
-	imagePath, pathErr := queryProcessImagePathFromHandle(handle)
-	if pathErr != nil {
-		procCloseHandleProcess.Call(handle)
-		if processHasGone(pathErr) {
-			return 0, false, nil
-		}
-		return 0, false, fmt.Errorf("revalidate Discord root PID %d image path: %w", pid, pathErr)
-	}
-	if !isStableDiscordImage(imagePath, client.installation.RootDir) {
-		procCloseHandleProcess.Call(handle)
-		return 0, false, fmt.Errorf(
-			"refuse to terminate PID %d: image changed from Discord Stable to %q",
-			pid,
-			imagePath,
-		)
-	}
-
-	exited, _, waitErr := processExitState(handle)
-	if waitErr != nil {
-		procCloseHandleProcess.Call(handle)
-		return 0, false, fmt.Errorf("revalidate Discord root PID %d state: %w", pid, waitErr)
-	}
-	if exited {
-		procCloseHandleProcess.Call(handle)
-		return 0, false, nil
-	}
-	return handle, true, nil
 }
 
 func processSessionID(pid uint32) (uint32, error) {
